@@ -1,4 +1,4 @@
-name: build-arm64-bean-probe
+name: build-arm64-bean
 on:
   workflow_dispatch:
   push:
@@ -410,6 +410,607 @@ jobs:
             return 0;
           }
           EOF_C1
+          cat > src/beanloader.c <<'EOF_C2'
+          /* beanloader - Milestone 2 port Bean Dreams (Kumobius, arm64-v8a -> Linux aarch64 / muOS).
+           * Memuat libKumoGame.so (ELF64 AArch64, bionic) SENDIRI tanpa dlopen, memetakan impornya ke shim bionic->glibc.
+           * Pakai: beanloader <folder-libs> [--stage N] [--timeout S] [--lib nama.so] [--selftest]
+           *   stage 0 = muat + relokasi + laporan resolusi simbol + cek titik masuk JNI (TIDAK ada kode game yang dijalankan)
+           *   stage 1 = + jalankan konstruktor (init_array) libKumoGame.so (kode game mulai jalan; belum ada JNI/grafik)
+           * Catatan glibc: JANGAN pakai strtol/sscanf/atoi dkk (dengan _GNU_SOURCE terikat ke GLIBC_2.38). */
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <stdarg.h>
+          #include <setjmp.h>
+          #include <errno.h>
+          #include <elf.h>
+          #include <link.h>
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <signal.h>
+          #include <ucontext.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <sys/utsname.h>
+          #include <sys/types.h>
+          #include <time.h>
+          #include <gnu/libc-version.h>
+
+          #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+          #define PAGE 4096u
+          #define MAXMOD 2
+          #define MAXUNRES 16
+          #define MAXDL 40
+
+          static FILE *g_log;
+
+          static void L(const char *fmt, ...) {
+            va_list ap;
+            va_start(ap, fmt); vfprintf(stdout, fmt, ap); va_end(ap); fflush(stdout);
+            if (g_log) { va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap); fflush(g_log); }
+          }
+
+          /* ======================= modul ELF ======================= */
+          typedef struct {
+            char name[64];
+            uint8_t *file; size_t fsize;
+            uint8_t *base; size_t span; uintptr_t bias;
+            Elf64_Sym *sym; int nsym; const char *str;
+            Elf64_Rela *rela; uint32_t nrela; Elf64_Rela *jrela; uint32_t njrela;
+            uint64_t init; uint64_t *iarr; uint32_t niarr;
+            uint64_t *rval; uint8_t *rhave;      /* cache resolusi simbol per indeks dynsym */
+          } Mod;
+
+          static Mod mods[MAXMOD];
+          static int nmods;
+
+          static const char *unres_name[MAXUNRES];
+          static int nunres;
+          static int cnt_self, cnt_mod, cnt_shim, cnt_libc, cnt_gl, cnt_unres, cnt_weak0;
+          static void *h_gles, *h_egl;
+          static volatile int g_cur_init = -1;
+
+          static int trap_unres(int i) {
+            L("\n*** PANGGILAN KE SIMBOL TAK TERSELESAIKAN: %s ***\n", (i >= 0 && i < nunres) ? unres_name[i] : "?");
+            _exit(3);
+            return 0;
+          }
+          #define TS(n) static int tstub_##n(void) { return trap_unres(n); }
+          TS(0) TS(1) TS(2) TS(3) TS(4) TS(5) TS(6) TS(7) TS(8) TS(9) TS(10) TS(11) TS(12) TS(13) TS(14) TS(15)
+          static void *const tstubs[MAXUNRES] = { (void *)tstub_0, (void *)tstub_1, (void *)tstub_2, (void *)tstub_3, (void *)tstub_4, (void *)tstub_5,
+            (void *)tstub_6, (void *)tstub_7, (void *)tstub_8, (void *)tstub_9, (void *)tstub_10, (void *)tstub_11, (void *)tstub_12, (void *)tstub_13,
+            (void *)tstub_14, (void *)tstub_15 };
+
+          /* ======================= kanari stack TLS =======================
+           * Kode Android arm64 membaca kanari stack dari [tpidr_el0 + 40] (TLS slot 5 bionic). Di glibc slot itu berisi data lain
+           * yang bisa berubah -> "stack smashing" palsu. Solusi: blok TLS executable ini (modul TLS pertama, mulai tp+16)
+           * diisi konstanta yang sama di semua kata; glibc menyalin gambar awal .tdata ke SETIAP thread baru. */
+          #define C8 0x5ad0c0de1badc0deULL
+          static __thread uint64_t g_tls_guard[16] __attribute__((aligned(16), used)) = { C8, C8, C8, C8, C8, C8, C8, C8, C8, C8, C8, C8, C8, C8, C8, C8 };
+
+          static int tls_guard_check(void) {
+          #if defined(__aarch64__)
+            uint64_t tp, v;
+            __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+            v = *(volatile uint64_t *)(tp + 40);
+            L("[tls] kanari di tp+40 = 0x%llx (harus 0x%llx) | blok TLS kita mulai di tp+%lld -> %s\n", (unsigned long long)v, (unsigned long long)C8,
+              (long long)((uintptr_t)&g_tls_guard[0] - (uintptr_t)tp), v == C8 ? "OK" : "TIDAK COCOK");
+            return v == C8 ? 0 : -1;
+          #else
+            (void)g_tls_guard;
+            L("[tls] (bukan aarch64: pengecekan kanari dilewati)\n");
+            return 0;
+          #endif
+          }
+
+          /* ======================= diagnostik crash ======================= */
+          static const char *game_sym(const Mod *m, uintptr_t a, uint64_t *delta) {
+            uint64_t off = (uint64_t)(a - m->bias), best = 0; const char *nm = NULL; int i;
+            for (i = 1; i < m->nsym; i++) {
+              const Elf64_Sym *y = &m->sym[i];
+              if (y->st_shndx == SHN_UNDEF || !y->st_name || ELF64_ST_TYPE(y->st_info) != STT_FUNC) continue;
+              if (y->st_value <= off && y->st_value >= best) { best = y->st_value; nm = m->str + y->st_name; }
+            }
+            *delta = off - best;
+            return nm;
+          }
+          static void describe(uintptr_t a) {
+            int i;
+            for (i = 0; i < nmods; i++)
+              if (a >= (uintptr_t)mods[i].base && a < (uintptr_t)mods[i].base + mods[i].span) {
+                uint64_t d = 0; const char *nm = game_sym(&mods[i], a, &d);
+                L("    -> %s + 0x%llx  [%s+0x%llx]\n", mods[i].name, (unsigned long long)(a - mods[i].bias), nm ? nm : "?", (unsigned long long)d);
+              }
+          }
+          /* parse hex manual: sscanf/strtoul di glibc build >=2.38 terikat ke simbol GLIBC_2.38 */
+          static int maps_range(const char *ln, uintptr_t *lo, uintptr_t *hi) {
+            const char *q = ln;
+            *lo = 0; *hi = 0;
+            while ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f')) *lo = *lo * 16 + (uintptr_t)(*q <= '9' ? *q - '0' : *q - 'a' + 10), q++;
+            if (*q == '-') q++;
+            while ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f')) *hi = *hi * 16 + (uintptr_t)(*q <= '9' ? *q - '0' : *q - 'a' + 10), q++;
+            return *hi != 0;
+          }
+          static void map_of(const char *tag, uintptr_t a) {
+            FILE *m = fopen("/proc/self/maps", "r");
+            char ln[512];
+            uintptr_t lo, hi;
+            if (!m) return;
+            while (fgets(ln, sizeof ln, m)) {
+              if (maps_range(ln, &lo, &hi) && a >= lo && a < hi) {
+                char *nl = strchr(ln, '\n'); if (nl) *nl = 0;
+                L("    %s in map: %s\n", tag, ln);
+                break;
+              }
+            }
+            fclose(m);
+          }
+          /* kandidat return address di modul game, dipindai dari sp ke atas (maks maxwords kata). Berguna saat abort karena exception C++ tak tertangkap. */
+          static void stack_candidates(uintptr_t sp, int maxwords, int maxshow, const char *tag) {
+            uintptr_t end = sp + (uintptr_t)maxwords * 8, lo, hi;
+            const uintptr_t *s = (const uintptr_t *)sp;
+            int k, shown = 0;
+            FILE *m = fopen("/proc/self/maps", "r");
+            char ln[512];
+            if (m) {
+              while (fgets(ln, sizeof ln, m)) {
+                if (maps_range(ln, &lo, &hi) && sp >= lo && sp < hi) { if (hi < end) end = hi; break; }
+              }
+              fclose(m);
+            }
+            L("  [stack%s] pindai sp=%p .. %p (%ld kata) untuk return address di modul game:\n", tag, (void *)sp, (void *)end, (long)((end - sp) / 8));
+            for (k = 0; sp + (uintptr_t)k * 8 + 8 <= end && shown < maxshow; k++) {
+              int i;
+              for (i = 0; i < nmods; i++)
+                if (s[k] >= (uintptr_t)mods[i].base && s[k] < (uintptr_t)mods[i].base + mods[i].span) {
+                  uint64_t d = 0; const char *nm = game_sym(&mods[i], s[k], &d);
+                  L("    sp+%d: %s + 0x%llx  [%s+0x%llx]\n", k * 8, mods[i].name, (unsigned long long)(s[k] - mods[i].bias), nm ? nm : "?", (unsigned long long)d);
+                  shown++; break;
+                }
+            }
+            if (!shown) L("    (tidak ada)\n");
+          }
+          static volatile int g_in_sig;
+          static void on_sig(int sig, siginfo_t *si, void *ctx) {
+            ucontext_t *uc = (ucontext_t *)ctx;
+            uintptr_t pc = 0, lr = 0, sp = 0;
+            if (g_in_sig++) _exit(128 + sig);   /* crash di dalam handler (mis. heap rusak): jangan berulang/menggantung */
+            (void)uc; (void)sp; (void)lr;
+          #if defined(__aarch64__)
+            pc = (uintptr_t)uc->uc_mcontext.pc; lr = (uintptr_t)uc->uc_mcontext.regs[30]; sp = (uintptr_t)uc->uc_mcontext.sp;
+          #endif
+            L("\n*** SINYAL %d  addr=%p  pc=%p  lr=%p  | konstruktor init_array yang sedang jalan: %d ***\n", sig, si->si_addr, (void *)pc, (void *)lr, g_cur_init);
+            describe(pc); describe(lr);
+          #if defined(__aarch64__)
+            {   /* backtrace lewat rantai frame-pointer (x29): tiap frame = {fp_sebelumnya, return_address} */
+              uintptr_t fp = (uintptr_t)uc->uc_mcontext.regs[29];
+              int n, k;
+              L("  [bt] (aman, tanpa malloc) rantai frame-pointer dari x29=%p:\n", (void *)fp);
+              for (n = 0; n < 32 && fp && !(fp & 7) && fp >= sp - 4096 && fp < sp + 0x400000; n++) {
+                const uintptr_t *fr = (const uintptr_t *)fp;
+                uintptr_t ra = fr[1], nfp = fr[0];
+                L("   #%d ra=%p\n", n, (void *)ra);
+                describe(ra);
+                if (nfp <= fp) break;
+                fp = nfp;
+              }
+              for (k = 0; k < 30; k += 4)
+                L("    x%-2d=%016llx x%-2d=%016llx x%-2d=%016llx x%-2d=%016llx\n", k, (unsigned long long)uc->uc_mcontext.regs[k], k + 1, (unsigned long long)uc->uc_mcontext.regs[k + 1],
+                  k + 2, (unsigned long long)uc->uc_mcontext.regs[k + 2], k + 3 < 30 ? k + 3 : 29, (unsigned long long)uc->uc_mcontext.regs[k + 3 < 30 ? k + 3 : 29]);
+              L("    sp=%016llx\n", (unsigned long long)sp);
+              if (pc > 64) {  /* kata instruksi di sekitar pc untuk disassembly offline */
+                const uint32_t *c = (const uint32_t *)((pc & ~(uintptr_t)3) - 48);
+                L("  [code] 12 kata sebelum pc + pc + 3 sesudah (mulai %p):", (const void *)c);
+                for (k = 0; k < 16; k++) { if (k % 4 == 0) L("\n   "); L(" %08x", c[k]); }
+                L("\n");
+              }
+              stack_candidates(sp, 24576, 80, "");
+            }
+          #endif
+            map_of("pc", pc); map_of("lr", lr);
+            _exit(128 + sig);
+          }
+          static void on_alarm(int sig) { (void)sig; L("\n*** WATCHDOG: waktu habis (konstruktor %d masih jalan), proses dihentikan ***\n", g_cur_init); _exit(4); }
+
+          /* ======================= shim bionic -> glibc ======================= */
+          /* bionic LP64: sizeof(FILE)=152; __sF = array 3 FILE (stdin, stdout, stderr). libc++ (iostream) memakai &__sF[n] -> petakan ke stdio glibc. */
+          #define BSF 152
+          static char bionic_sF[3 * BSF];
+          static int is_sF(FILE *f) { uintptr_t a = (uintptr_t)f, b = (uintptr_t)bionic_sF; return a >= b && a < b + sizeof bionic_sF; }
+          static FILE *xf(FILE *f) {
+            if (is_sF(f)) { unsigned i = (unsigned)(((uintptr_t)f - (uintptr_t)bionic_sF) / BSF); return i == 0 ? stdin : i == 1 ? stdout : stderr; }
+            return f;
+          }
+          static int b_fputc(int c, FILE *f) { return fputc(c, xf(f)); }
+          static int b_fflush(FILE *f) { return fflush(f ? xf(f) : NULL); }
+          static size_t b_fwrite(const void *p, size_t s, size_t n, FILE *f) { return fwrite(p, s, n, xf(f)); }
+          static size_t b_fread(void *p, size_t s, size_t n, FILE *f) { return fread(p, s, n, xf(f)); }
+          static int b_vfprintf(FILE *f, const char *fmt, va_list ap) { return vfprintf(xf(f), fmt, ap); }
+          static int b_feof(FILE *f) { return feof(xf(f)); }
+          static int b_ferror(FILE *f) { return ferror(xf(f)); }
+          static int b_getc(FILE *f) { return getc(xf(f)); }
+          static int b_fgetc(FILE *f) { return fgetc(xf(f)); }
+          static int b_ungetc(int c, FILE *f) { return ungetc(c, xf(f)); }
+          static int b_fseek(FILE *f, long o, int w) { return fseek(xf(f), o, w); }
+          static long b_ftell(FILE *f) { return ftell(xf(f)); }
+          __attribute__((noinline)) static int b_fclose(FILE *f) { return is_sF(f) ? 0 : fclose(f); }   /* jangan pernah menutup stdout/stderr asli */
+
+          static int *b_errno(void) { return &errno; }
+          static int g_droid_n;
+          static int b_android_log_write(int prio, const char *tag, const char *text) {
+            if (g_droid_n++ < 4000) L("[droid %d/%s] %s%s", prio, tag ? tag : "?", text ? text : "", (text && text[0] && text[strlen(text) - 1] == '\n') ? "" : "\n");
+            return 1;
+          }
+          static int b_android_log_vprint(int prio, const char *tag, const char *fmt, va_list ap) {
+            char buf[1024]; vsnprintf(buf, sizeof buf, fmt ? fmt : "", ap);
+            return b_android_log_write(prio, tag, buf);
+          }
+          static int b_android_log_print(int prio, const char *tag, const char *fmt, ...) {
+            va_list ap; int r; va_start(ap, fmt); r = b_android_log_vprint(prio, tag, fmt, ap); va_end(ap); return r;
+          }
+          static void b_assert2(const char *file, int line, const char *func, const char *msg) {
+            L("\n*** ASSERT bionic: %s:%d (%s): %s ***\n", file, line, func, msg);
+            abort();
+          }
+          static void b_set_abort_message(const char *msg) {
+            L("[droid] android_set_abort_message: %s\n", msg ? msg : "(null)");
+            if (msg && strstr(msg, "uncaught exception")) stack_candidates((uintptr_t)__builtin_frame_address(0), 24576, 80, " abort");
+          }
+          extern int __xpg_strerror_r(int, char *, size_t);
+          static int b_strerror_r(int e, char *buf, size_t n) { return __xpg_strerror_r(e, buf, n); }  /* bionic = versi XSI (int) */
+
+          /* dlopen/dlsym dari game: nama lib Android dipetakan ke nama glibc; semua dicatat supaya kelihatan apa yang diminta game */
+          static char dl_seen[MAXDL][120];
+          static int n_dl;
+          static void dl_note(const char *what, const char *a, const char *b, void *r) {
+            if (n_dl < MAXDL) snprintf(dl_seen[n_dl++], sizeof dl_seen[0], "%s(%s%s%s) -> %p", what, a ? a : "NULL", b ? ", " : "", b ? b : "", r);
+            L("[dl] %s(%s%s%s) -> %p\n", what, a ? a : "NULL", b ? ", " : "", b ? b : "", r);
+          }
+          static void *b_dlopen(const char *name, int flags) {
+            const char *m = name;
+            void *h;
+            if (name) {
+              if (!strcmp(name, "libEGL.so")) m = "libEGL.so.1";
+              else if (!strcmp(name, "libGLESv2.so")) m = "libGLESv2.so.2";
+              else if (!strcmp(name, "libc.so") || !strcmp(name, "libdl.so")) m = "libc.so.6";
+              else if (!strcmp(name, "libm.so")) m = "libm.so.6";
+            }
+            h = dlopen(m, flags ? flags : RTLD_NOW);
+            dl_note("dlopen", name, NULL, h);
+            return h;
+          }
+          static void *b_dlsym(void *h, const char *sym) {
+            void *r = dlsym(h, sym);
+            if (!r && h_gles && sym) r = dlsym(h_gles, sym);
+            if (!r && h_egl && sym) r = dlsym(h_egl, sym);
+            dl_note("dlsym", sym, NULL, r);
+            return r;
+          }
+          static int b_dlclose(void *h) { (void)h; return 0; }
+          static char *b_dlerror(void) { return dlerror(); }
+
+          /* dl_iterate_phdr: unwinder C++ (libunwind statis di libKumoGame) memakai ini untuk mencari .eh_frame. Modul yang kita muat
+           * sendiri TIDAK terlihat oleh glibc, jadi laporkan sendiri lalu lanjut ke daftar glibc. */
+          static int b_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *), void *data) {
+            int i, r;
+            for (i = 0; i < nmods; i++) {
+              const Elf64_Ehdr *eh = (const Elf64_Ehdr *)mods[i].file;
+              struct dl_phdr_info info;
+              memset(&info, 0, sizeof info);
+              info.dlpi_addr = (ElfW(Addr))mods[i].bias;
+              info.dlpi_name = mods[i].name;
+              info.dlpi_phdr = (const ElfW(Phdr) *)(mods[i].file + eh->e_phoff);
+              info.dlpi_phnum = eh->e_phnum;
+              info.dlpi_adds = (unsigned long long)nmods;
+              r = cb(&info, sizeof info, data);
+              if (r) return r;
+            }
+            return dl_iterate_phdr(cb, data);
+          }
+
+          typedef struct { const char *name; void *addr; } Shim;
+          static const Shim shim[] = {
+            {"__errno", (void *)b_errno}, {"__sF", bionic_sF},
+            {"__android_log_print", (void *)b_android_log_print}, {"__android_log_vprint", (void *)b_android_log_vprint},
+            {"__android_log_write", (void *)b_android_log_write}, {"__assert2", (void *)b_assert2}, {"android_set_abort_message", (void *)b_set_abort_message},
+            {"fputc", (void *)b_fputc}, {"fflush", (void *)b_fflush}, {"fwrite", (void *)b_fwrite}, {"fread", (void *)b_fread}, {"vfprintf", (void *)b_vfprintf},
+            {"feof", (void *)b_feof}, {"ferror", (void *)b_ferror}, {"getc", (void *)b_getc}, {"fgetc", (void *)b_fgetc}, {"ungetc", (void *)b_ungetc},
+            {"fseek", (void *)b_fseek}, {"ftell", (void *)b_ftell}, {"fclose", (void *)b_fclose},
+            /* bionic jmp_buf = 256 byte; setjmp glibc menyimpan signal mask -> menulis sampai 312 byte (meluap). _setjmp tidak menyimpan mask. */
+            {"setjmp", (void *)_setjmp},
+            {"strerror_r", (void *)b_strerror_r}, {"dl_iterate_phdr", (void *)b_dl_iterate_phdr},
+            {"dlopen", (void *)b_dlopen}, {"dlsym", (void *)b_dlsym}, {"dlclose", (void *)b_dlclose}, {"dlerror", (void *)b_dlerror},
+            {NULL, NULL}
+          };
+          #define NSHIM ((int)(sizeof shim / sizeof shim[0]))
+          static unsigned char shim_hit[NSHIM];
+          static const void *shim_addr(const char *n) { int i; for (i = 0; shim[i].name; i++) if (!strcmp(shim[i].name, n)) return shim[i].addr; return NULL; }
+
+          /* ======================= pemuat ELF64 ======================= */
+          static int read_file(const char *path, uint8_t **buf, size_t *len) {
+            FILE *f = fopen(path, "rb");
+            long n;
+            if (!f) return -1;
+            fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+            *buf = malloc((size_t)n);
+            if (!*buf || fread(*buf, 1, (size_t)n, f) != (size_t)n) { fclose(f); return -1; }
+            fclose(f); *len = (size_t)n;
+            return 0;
+          }
+
+          static int load_mod(const char *dir, const char *name, Mod **out) {
+            char path[512];
+            Mod *m;
+            const Elf64_Ehdr *eh;
+            const Elf64_Phdr *ph;
+            uint64_t minv = ~0ULL, maxv = 0;
+            size_t align = 0x4000;
+            void *raw;
+            int i, dyn_found = 0;
+            if (nmods >= MAXMOD) return -1;
+            m = &mods[nmods];
+            memset(m, 0, sizeof *m);
+            snprintf(m->name, sizeof m->name, "%s", name);
+            snprintf(path, sizeof path, "%s/%s", dir, name);
+            if (read_file(path, &m->file, &m->fsize) != 0) { L("GAGAL membaca %s\n", path); return -1; }
+            eh = (const Elf64_Ehdr *)m->file;
+            if (m->fsize < sizeof *eh || memcmp(eh->e_ident, ELFMAG, SELFMAG) || eh->e_ident[EI_CLASS] != ELFCLASS64 || eh->e_machine != EM_AARCH64 || eh->e_type != ET_DYN) {
+              L("%s: bukan ELF AArch64 shared object\n", name); return -1;
+            }
+            ph = (const Elf64_Phdr *)(m->file + eh->e_phoff);
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+              if (ph[i].p_vaddr < minv) minv = ph[i].p_vaddr;
+              if (ph[i].p_vaddr + ph[i].p_memsz > maxv) maxv = ph[i].p_vaddr + ph[i].p_memsz;
+              if (ph[i].p_align > align) align = (size_t)ph[i].p_align;
+            }
+            minv &= ~(uint64_t)(PAGE - 1); maxv = (maxv + PAGE - 1) & ~(uint64_t)(PAGE - 1);
+            m->span = (size_t)(maxv - minv);
+            raw = mmap(NULL, m->span + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (raw == MAP_FAILED) { L("%s: mmap gagal\n", name); return -1; }
+            m->base = (uint8_t *)(((uintptr_t)raw + align - 1) & ~(uintptr_t)(align - 1));
+            m->bias = (uintptr_t)m->base - (uintptr_t)minv;
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+              if ((size_t)ph[i].p_offset + ph[i].p_filesz > m->fsize) { L("%s: segmen melewati ujung file\n", name); return -1; }
+              memcpy((void *)(m->bias + ph[i].p_vaddr), m->file + ph[i].p_offset, ph[i].p_filesz);
+            }
+            for (i = 0; i < eh->e_phnum; i++) {
+              if (ph[i].p_type == PT_TLS) { L("%s: punya PT_TLS (belum didukung)\n", name); return -1; }
+              if (ph[i].p_type == PT_DYNAMIC) {
+                const Elf64_Dyn *d = (const Elf64_Dyn *)(m->bias + ph[i].p_vaddr);
+                dyn_found = 1;
+                for (; d->d_tag != DT_NULL; d++) {
+                  switch (d->d_tag) {
+                    case DT_SYMTAB: m->sym = (Elf64_Sym *)(m->bias + d->d_un.d_ptr); break;
+                    case DT_STRTAB: m->str = (const char *)(m->bias + d->d_un.d_ptr); break;
+                    case DT_RELA: m->rela = (Elf64_Rela *)(m->bias + d->d_un.d_ptr); break;
+                    case DT_RELASZ: m->nrela = (uint32_t)(d->d_un.d_val / sizeof(Elf64_Rela)); break;
+                    case DT_JMPREL: m->jrela = (Elf64_Rela *)(m->bias + d->d_un.d_ptr); break;
+                    case DT_PLTRELSZ: m->njrela = (uint32_t)(d->d_un.d_val / sizeof(Elf64_Rela)); break;
+                    case DT_INIT: m->init = d->d_un.d_val; break;
+                    case DT_INIT_ARRAY: m->iarr = (uint64_t *)(m->bias + d->d_un.d_ptr); break;
+                    case DT_INIT_ARRAYSZ: m->niarr = (uint32_t)(d->d_un.d_val / 8); break;
+                    case DT_REL: case 36 /* DT_RELR */: case 0x6000000f: case 0x60000011: case DT_TEXTREL:
+                      L("%s: tipe relokasi tidak didukung (tag 0x%x)\n", name, (unsigned)d->d_tag); return -1;
+                    default: break;
+                  }
+                }
+              }
+            }
+            if (!dyn_found || !m->sym || !m->str) { L("%s: section dinamis tidak lengkap\n", name); return -1; }
+            if (eh->e_shoff && (size_t)eh->e_shoff + (size_t)eh->e_shnum * sizeof(Elf64_Shdr) <= m->fsize) {
+              const Elf64_Shdr *sh = (const Elf64_Shdr *)(m->file + eh->e_shoff);
+              for (i = 0; i < eh->e_shnum; i++) if (sh[i].sh_type == SHT_DYNSYM) m->nsym = (int)(sh[i].sh_size / sizeof(Elf64_Sym));
+            }
+            if (m->nsym <= 0) { L("%s: jumlah simbol tidak diketahui\n", name); return -1; }
+            m->rval = calloc((size_t)m->nsym, sizeof(uint64_t));
+            m->rhave = calloc((size_t)m->nsym, 1);
+            nmods++;
+            *out = m;
+            L("[load] %s: base=%p span=0x%zx bias=0x%lx simbol=%d rela=%u jmprel=%u init_array=%u\n", name, (void *)m->base, m->span, (unsigned long)m->bias, m->nsym, m->nrela, m->njrela, m->niarr);
+            return 0;
+          }
+
+          static void *mod_find(const Mod *m, const char *name) {
+            int i;
+            for (i = 1; i < m->nsym; i++) {
+              const Elf64_Sym *s = &m->sym[i];
+              if (s->st_shndx != SHN_UNDEF && s->st_name && ELF64_ST_BIND(s->st_info) != STB_LOCAL && strcmp(m->str + s->st_name, name) == 0) return (void *)(m->bias + s->st_value);
+            }
+            return NULL;
+          }
+
+          static uint64_t resolve_uncached(Mod *self, const Elf64_Sym *s) {
+            const char *n = self->str + s->st_name;
+            int i;
+            void *p;
+            if (s->st_shndx != SHN_UNDEF) { cnt_self++; return s->st_shndx == SHN_ABS ? s->st_value : (uint64_t)(self->bias + s->st_value); }
+            for (i = 0; i < nmods; i++) if (&mods[i] != self && (p = mod_find(&mods[i], n))) { cnt_mod++; return (uint64_t)(uintptr_t)p; }
+            for (i = 0; shim[i].name; i++) if (strcmp(shim[i].name, n) == 0) { cnt_shim++; shim_hit[i] = 1; return (uint64_t)(uintptr_t)shim[i].addr; }
+            if ((p = dlsym(RTLD_DEFAULT, n))) { cnt_libc++; return (uint64_t)(uintptr_t)p; }
+            if (h_gles && (p = dlsym(h_gles, n))) { cnt_gl++; return (uint64_t)(uintptr_t)p; }
+            if (h_egl && (p = dlsym(h_egl, n))) { cnt_gl++; return (uint64_t)(uintptr_t)p; }
+            if (ELF64_ST_BIND(s->st_info) == STB_WEAK) { cnt_weak0++; return 0; }
+            for (i = 0; i < nunres; i++) if (strcmp(unres_name[i], n) == 0) return (uint64_t)(uintptr_t)tstubs[i];
+            cnt_unres++;
+            if (nunres < MAXUNRES) { unres_name[nunres] = n; return (uint64_t)(uintptr_t)tstubs[nunres++]; }
+            return (uint64_t)(uintptr_t)tstubs[MAXUNRES - 1];
+          }
+          static uint64_t resolve(Mod *self, uint32_t si) {
+            if (si == 0) return 0;
+            if (!self->rhave[si]) { self->rval[si] = resolve_uncached(self, &self->sym[si]); self->rhave[si] = 1; }
+            return self->rval[si];
+          }
+
+          static int relocate(Mod *m) {
+            int pass, bad = 0;
+            unsigned ntype[2048] = {0};
+            for (pass = 0; pass < 2; pass++) {
+              Elf64_Rela *r = pass ? m->jrela : m->rela;
+              uint32_t n = pass ? m->njrela : m->nrela, k;
+              for (k = 0; k < n; k++) {
+                uint32_t type = (uint32_t)ELF64_R_TYPE(r[k].r_info), si = (uint32_t)ELF64_R_SYM(r[k].r_info);
+                uint64_t *where = (uint64_t *)(m->bias + r[k].r_offset);
+                if (type < 2048) ntype[type]++;
+                switch (type) {
+                  case 0: break;                                                     /* R_AARCH64_NONE */
+                  case 1027: *where = (uint64_t)m->bias + (uint64_t)r[k].r_addend; break;   /* RELATIVE */
+                  case 257: *where = resolve(m, si) + (uint64_t)r[k].r_addend; break;       /* ABS64 */
+                  case 1025: case 1026: *where = resolve(m, si) + (uint64_t)r[k].r_addend; break;  /* GLOB_DAT, JUMP_SLOT */
+                  default: L("[reloc] %s: tipe tidak didukung %u (offset 0x%llx)\n", m->name, type, (unsigned long long)r[k].r_offset); bad++; break;
+                }
+              }
+            }
+            L("[reloc] %s: RELATIVE=%u ABS64=%u GLOB_DAT=%u JUMP_SLOT=%u tak-didukung=%d\n", m->name, ntype[1027], ntype[257], ntype[1025], ntype[1026], bad);
+            return bad;
+          }
+
+          static void protect(Mod *m) {
+            const Elf64_Ehdr *eh = (const Elf64_Ehdr *)m->file;
+            const Elf64_Phdr *ph = (const Elf64_Phdr *)(m->file + eh->e_phoff);
+            size_t np = m->span / PAGE, p;
+            unsigned char *fl = calloc(np, 1);
+            int i;
+            __builtin___clear_cache((char *)m->base, (char *)m->base + m->span);
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+              uintptr_t a = (m->bias + ph[i].p_vaddr) & ~(uintptr_t)(PAGE - 1);
+              uintptr_t e = (m->bias + ph[i].p_vaddr + ph[i].p_memsz + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
+              unsigned pr = ((ph[i].p_flags & PF_R) ? PROT_READ : 0) | ((ph[i].p_flags & PF_W) ? PROT_WRITE : 0) | ((ph[i].p_flags & PF_X) ? PROT_EXEC : 0);
+              for (; a < e; a += PAGE) fl[(a - (uintptr_t)m->base) / PAGE] |= (unsigned char)pr;
+            }
+            for (p = 0; p < np; ) {
+              size_t q = p + 1;
+              while (q < np && fl[q] == fl[p]) q++;
+              if (fl[p] && mprotect(m->base + p * PAGE, (q - p) * PAGE, fl[p]) != 0) L("[protect] %s: mprotect gagal: %s\n", m->name, strerror(errno));
+              p = q;
+            }
+            free(fl);
+          }
+
+          extern char **environ;
+          static long long now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec * 1000000000LL + t.tv_nsec; }
+          static void run_init(Mod *m) {
+            uint32_t i;
+            long long t0 = now_ns();
+            if (m->init) { L("[init] %s: DT_INIT di 0x%llx\n", m->name, (unsigned long long)m->init); ((void (*)(void))(m->bias + m->init))(); }
+            for (i = 0; i < m->niarr; i++) {
+              uint64_t f = m->iarr[i];
+              if (f == 0 || f == ~0ULL) continue;
+              g_cur_init = (int)i;
+              L("[init] %s: init_array[%u/%u] = +0x%llx\n", m->name, i, m->niarr, (unsigned long long)(f - m->bias));
+              ((void (*)(int, char **, char **))(uintptr_t)f)(0, NULL, environ);
+            }
+            g_cur_init = -1;
+            L("[init] %s: selesai (%u konstruktor, %.1f ms)\n", m->name, m->niarr, (double)(now_ns() - t0) / 1e6);
+          }
+
+          static int pint(const char *s) { int v = 0; while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0'); return v; }
+
+          /* titik masuk JNI yang akan dipanggil loader di stage berikutnya (nama persis dari classes.dex, class NativeInterface) */
+          static const char *const jni_names[] = { "NativeInit", "NativeActivate", "NativeDeactivate", "NativeResized", "NativeRender", "NativeBeginAtomic", "NativeEndAtomic",
+            "NativeKeyDownUp", "NativePointerDown", "NativePointerMove", "NativePointerUp", "NativePointerCancel", "NativeBundlePathChanged", "NativeContextLost",
+            "NativeAccelerationEvent", "NativeDownloadData", "NativeDownloadSuccess", "NativeDownloadFailure", "NativePushAdReward", "NativePushCloudValues",
+            "NativeIapComplete", "NativeScoresSubmitted", NULL };
+          static int jni_check(Mod *m) {
+            int i, found = 0, total = 0;
+            char full[160];
+            L("\n== titik masuk JNI (Java_com_kumobius_android_NativeInterface_*) ==\n");
+            for (i = 0; jni_names[i]; i++) {
+              void *f;
+              snprintf(full, sizeof full, "Java_com_kumobius_android_NativeInterface_%s", jni_names[i]);
+              f = mod_find(m, full);
+              total++;
+              if (f) { found++; L("  %-26s +0x%llx\n", jni_names[i], (unsigned long long)((uintptr_t)f - m->bias)); }
+              else L("  %-26s TIDAK ADA\n", jni_names[i]);
+            }
+            L("ditemukan %d dari %d | JNI_OnLoad: %s\n", found, total, mod_find(m, "JNI_OnLoad") ? "ada" : "tidak ada (memang tidak dipakai game ini)");
+            return found == total ? 0 : 1;
+          }
+
+          /* ======================= uji mandiri (jalan di x86 maupun aarch64) ======================= */
+          static int selftest(void) {
+            int ok = 1;
+            char buf[32];
+            L("== selftest ==\n");
+            if (xf((FILE *)(bionic_sF + 0 * BSF)) == stdin && xf((FILE *)(bionic_sF + 1 * BSF)) == stdout && xf((FILE *)(bionic_sF + 2 * BSF + 40)) == stderr && xf(stdout) == stdout) L("  xf (__sF -> stdio): LULUS\n"); else { L("  xf: GAGAL\n"); ok = 0; }
+            errno = 7;
+            if (*b_errno() == 7) L("  __errno: LULUS\n"); else { L("  __errno: GAGAL\n"); ok = 0; }
+            if (b_strerror_r(2, buf, sizeof buf) == 0 && buf[0]) L("  strerror_r XSI: LULUS (\"%s\")\n", buf); else { L("  strerror_r: GAGAL\n"); ok = 0; }
+            if (b_fclose((FILE *)(bionic_sF + BSF)) == 0 && fputc('.', stdout) == '.') L("\n  fclose(&__sF[1]) tidak menutup stdout: LULUS\n"); else { L("  fclose sF: GAGAL\n"); ok = 0; }
+            if (b_fwrite("ab\n", 1, 3, (FILE *)(bionic_sF + 1 * BSF)) == 3) L("  fwrite -> stdout lewat __sF: LULUS\n"); else { L("  fwrite sF: GAGAL\n"); ok = 0; }
+            if (shim_addr("__errno") && shim_addr("__sF") && shim_addr("setjmp") && shim_addr("dl_iterate_phdr") && !shim_addr("tidak_ada_ini")) L("  tabel shim: LULUS\n"); else { L("  tabel shim: GAGAL\n"); ok = 0; }
+            L("== selftest %s ==\n", ok ? "SEMUA LULUS" : "ADA YANG GAGAL");
+            return ok ? 0 : 1;
+          }
+
+          /* ======================= main ======================= */
+          int main(int argc, char **argv) {
+            const char *dir = "libs", *libname = "libKumoGame.so";
+            int stage = 0, timeout = 60, i, do_selftest = 0;
+            Mod *kg = NULL;
+            struct sigaction sa;
+            struct utsname u;
+            stack_t ss0;
+
+            for (i = 1; i < argc; i++) {
+              if (!strcmp(argv[i], "--selftest")) do_selftest = 1;
+              else if (!strcmp(argv[i], "--stage") && i + 1 < argc) stage = pint(argv[++i]);
+              else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) timeout = pint(argv[++i]);
+              else if (!strcmp(argv[i], "--lib") && i + 1 < argc) libname = argv[++i];
+              else if (argv[i][0] != '-') dir = argv[i];
+            }
+            g_log = fopen("loader_log.txt", "w");
+            L("== beanloader (Milestone 2: stage 0/1) ==\n");
+            if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
+            L("libs: %s/%s | stage=%d timeout=%ds\n", dir, libname, stage, timeout);
+          #if !defined(__aarch64__)
+            L("(bukan aarch64: hanya stage 0 / selftest yang valid; kode game TIDAK akan dijalankan)\n");
+            if (stage > 0) stage = 0;
+          #endif
+
+            memset(&sa, 0, sizeof sa);
+            sa.sa_sigaction = on_sig; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+            ss0.ss_sp = malloc(1u << 17); ss0.ss_size = 1u << 17; ss0.ss_flags = 0;
+            if (ss0.ss_sp) sigaltstack(&ss0, NULL);
+            sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGILL, &sa, NULL);
+            sigaction(SIGFPE, &sa, NULL);  sigaction(SIGABRT, &sa, NULL);
+            signal(SIGALRM, on_alarm);
+
+            if (do_selftest) return selftest();
+            if (tls_guard_check() != 0 && stage > 0) { L("kanari TLS tidak cocok: kode game akan crash 'stack smashing'. Berhenti.\n"); return 1; }
+
+            dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
+            h_gles = dlopen("libGLESv2.so.2", RTLD_LAZY | RTLD_LOCAL);
+            h_egl = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
+            L("GLESv2: %s | EGL: %s\n", h_gles ? "OK" : "TIDAK ADA", h_egl ? "OK" : "TIDAK ADA");
+
+            if (load_mod(dir, libname, &kg) != 0) return 1;
+            if (relocate(kg) != 0) return 1;
+            protect(kg);
+
+            L("\n== ringkasan resolusi simbol (unik per modul) ==\n");
+            L("modul sendiri=%d | shim=%d | glibc=%d | GL/EGL=%d | weak->0=%d | TAK TERSELESAIKAN=%d\n", cnt_self, cnt_shim, cnt_libc, cnt_gl, cnt_weak0, cnt_unres);
+            for (i = 0; i < nunres; i++) L("  TAK TERSELESAIKAN: %s\n", unres_name[i]);
+            L("  shim terpakai:");
+            for (i = 0; shim[i].name; i++) if (shim_hit[i]) L(" %s", shim[i].name);
+            L("\n");
+            jni_check(kg);
+
+            if (stage < 1) { L("\n== stage 0 selesai (tidak ada kode game yang dijalankan) ==\n"); return cnt_unres ? 1 : 0; }
+            if (cnt_unres) { L("\nAda simbol tak terselesaikan -> stage 1 dibatalkan.\n"); return 1; }
+            if (timeout > 0) alarm((unsigned)timeout);
+
+            L("\n== konstruktor (stage 1) ==\n");
+            run_init(kg);
+            L("\n== dlopen/dlsym yang diminta game selama konstruktor (%d) ==\n", n_dl);
+            for (i = 0; i < n_dl; i++) L("  %s\n", dl_seen[i]);
+            L("\n== stage 1 selesai ==\n");
+            fflush(NULL);
+            _exit(0);   /* hindari destruktor atexit milik game */
+          }
+          EOF_C2
           cat > out/BeanProbe.sh <<'EOF_SH1'
           #!/bin/bash
           # Probe Bean Dreams (Milestone 1, arm64). Hanya membaca, tidak mengubah apa pun.
@@ -457,24 +1058,74 @@ jobs:
           sleep 2
           type pm_finish >/dev/null 2>&1 && pm_finish
           EOF_SH1
-          echo "Taruh libKumoGame.so (dari lib/arm64-v8a di APK Bean Dreams) ke folder ini. Taruh juga APK-nya di folder game dengan nama bean-dreams.apk (nanti dipakai loader). Jangan di-upload ke GitHub." > out/bean_dreams/libs/TARUH-LIB-DI-SINI.txt
+          cat > out/BeanLoader.sh <<'EOF_SH2'
+          #!/bin/bash
+          # Loader Bean Dreams (Milestone 2, arm64). Argumen dibaca dari loader.args, mis: --stage 1 --timeout 60
+          # Folder data dicari seperti launcher PortMaster lain: /$directory/ports/<nama>
+
+          XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+
+          if [ -d "/opt/system/Tools/PortMaster/" ]; then
+            controlfolder="/opt/system/Tools/PortMaster"
+          elif [ -d "/opt/tools/PortMaster/" ]; then
+            controlfolder="/opt/tools/PortMaster"
+          elif [ -d "$XDG_DATA_HOME/PortMaster/" ]; then
+            controlfolder="$XDG_DATA_HOME/PortMaster"
+          else
+            controlfolder="/roms/ports/PortMaster"
+          fi
+
+          source $controlfolder/control.txt
+          [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
+
+          GAMEDIR="/$directory/ports/bean_dreams"
+          [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/bean_dreams"
+
+          cd "$GAMEDIR" || {
+            echo "folder bean_dreams tidak ketemu. Dicari di: /$directory/ports/bean_dreams dan di sebelah script ini." > "$(dirname "$0")/loader_error.txt"
+            exit 1
+          }
+
+          chmod +x ./beanloader 2>/dev/null
+
+          if [ ! -f libs/libKumoGame.so ] || [ ! -f ./beanloader ]; then
+            echo "libs/libKumoGame.so atau beanloader belum ada di $GAMEDIR" > loader_stdout.txt
+            sleep 3
+            exit 1
+          fi
+
+          export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
+          # hapus log lama supaya tidak tertukar dengan hasil run ini
+          rm -f loader_log.txt
+          LOADER_ARGS="$(cat loader.args 2>/dev/null)"
+          echo "GAMEDIR=$GAMEDIR  args=$LOADER_ARGS" > loader_stdout.txt
+          ./beanloader libs $LOADER_ARGS >> loader_stdout.txt 2>&1
+          echo "exit code: $?" >> loader_stdout.txt
+          sleep 2
+          type pm_finish >/dev/null 2>&1 && pm_finish
+          EOF_SH2
+          echo "--stage 0 --timeout 60" > out/bean_dreams/loader.args
+          echo "Taruh libKumoGame.so (dari lib/arm64-v8a di APK Bean Dreams) ke folder ini. Taruh juga APK-nya di folder game dengan nama bean-dreams.apk (dipakai loader stage berikutnya). Jangan di-upload ke GitHub." > out/bean_dreams/libs/TARUH-LIB-DI-SINI.txt
 
       - name: Kompilasi (aarch64)
         run: |
           aarch64-linux-gnu-gcc -O2 -Wall -Wextra -o out/bean_dreams/elfprobe64 src/elfprobe64.c -ldl
-          file out/bean_dreams/elfprobe64 || true
-          echo "--- elfprobe64: library yang dibutuhkan:"
-          aarch64-linux-gnu-readelf -d out/bean_dreams/elfprobe64 | grep NEEDED
-          MAXV=$(aarch64-linux-gnu-readelf -V out/bean_dreams/elfprobe64 | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
-          echo "elfprobe64 butuh GLIBC tertinggi: $MAXV (device: 2.37 atau lebih baru)"
-          if [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
-            echo "GAGAL: elfprobe64 butuh glibc lebih baru dari 2.37. Simbol penyebab:"
-            aarch64-linux-gnu-nm -D --undefined-only out/bean_dreams/elfprobe64 | grep -E 'GLIBC_2\.(3[89]|[4-9][0-9])'
-            exit 1
-          fi
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -Wno-format-truncation -o out/bean_dreams/beanloader src/beanloader.c -ldl -lm
+          file out/bean_dreams/elfprobe64 out/bean_dreams/beanloader || true
+          for B in elfprobe64 beanloader; do
+            echo "--- $B: library yang dibutuhkan:"
+            aarch64-linux-gnu-readelf -d out/bean_dreams/$B | grep NEEDED
+            MAXV=$(aarch64-linux-gnu-readelf -V out/bean_dreams/$B | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+            echo "$B butuh GLIBC tertinggi: $MAXV (device: 2.37 atau lebih baru)"
+            if [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
+              echo "GAGAL: $B butuh glibc lebih baru dari 2.37. Simbol penyebab:"
+              aarch64-linux-gnu-nm -D --undefined-only out/bean_dreams/$B | grep -E 'GLIBC_2\.(3[89]|[4-9][0-9])'
+              exit 1
+            fi
+          done
 
       - name: Unggah hasil build
         uses: actions/upload-artifact@v4
         with:
-          name: bean-probe-arm64
+          name: bean-arm64
           path: out
