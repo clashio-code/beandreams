@@ -411,14 +411,14 @@ jobs:
           }
           EOF_C1
           cat > src/beanloader.c <<'EOF_C2'
-          /* beanloader - Milestone 3 port Bean Dreams (Kumobius, arm64-v8a -> Linux aarch64 / muOS).
+          /* beanloader - Milestone 4 port Bean Dreams (Kumobius, arm64-v8a -> Linux aarch64 / muOS).
            * Memuat libKumoGame.so (ELF64 AArch64, bionic) SENDIRI tanpa dlopen, memetakan impornya ke shim bionic->glibc.
            * Pakai: beanloader <folder-libs> [--stage N] [--timeout S] [--lib nama.so] [--selftest]
            *   stage 0 = muat + relokasi + laporan resolusi simbol + cek titik masuk JNI (TIDAK ada kode game yang dijalankan)
            *   stage 1 = + jalankan konstruktor (init_array) libKumoGame.so (kode game mulai jalan; belum ada JNI/grafik)
-           *   stage 2 = + JNI palsu, jendela SDL2/GLES2, NativeInit/Resized/Activate, lalu --frames N frame NativeRender (default 300) + tangkapan layar
-           *   stage 3 = seperti stage 2 tanpa batas frame (main sungguhan; SELECT+START untuk keluar)
-           * Opsi stage 2/3: --apk NAMA --frames N --lofi 0|1 --locale en_US --overrides ",console,controller" --w 640 --h 480 --shots "120,300"
+           *   stage 2 = + JNI palsu, jendela SDL2/GLES2, suara (WAV hasil convert_audio.py), NativeInit/Resized/Activate, lalu --frames N frame NativeRender (default 300) + tangkapan layar
+           *   stage 3 = seperti stage 2 tanpa batas frame (main sungguhan; SELECT+START keluar, START+L1 = tangkapan layar)
+           * Opsi stage 2/3: --apk NAMA --frames N --maxtime DETIK --lofi 0|1 --audio 0|1 --locale en_US --overrides ",console,controller" --w 640 --h 480 --shots "120,300"
            * Catatan glibc: JANGAN pakai strtol/sscanf/atoi dkk (dengan _GNU_SOURCE terikat ke GLIBC_2.38). */
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -1056,6 +1056,19 @@ jobs:
             }
           }
 
+          /* ---- audio (diimplementasi di bagian audio, setelah inisialisasi SDL) ---- */
+          static void au_load_sound(const char *name, const char *apkpath);
+          static void au_unload_sound(const char *name);
+          static void au_play_sound(int64_t id, const char *name, float vol, float pitch, int loop);
+          static void au_stop_sound(int64_t id);
+          static void au_set_sound_vol(int64_t id, float v);
+          static void au_set_sound_pitch(int64_t id, float p);
+          static void au_play_music(const char *path, int enabled, int loopcount);
+          static void au_stop_music(void);
+          static void au_set_music_vol(float v);
+          static void au_set_music_enabled(int e);
+          static void au_play_voice(const char *path);
+
           /* ---- handler method INativeResponder (Java -> C). Hasil default 0/false/null; method tak dikenal dicatat. ---- */
           static int64_t g_snd_id = 100, g_prompt_id = 1000;
           static volatile int g_quit;
@@ -1065,10 +1078,17 @@ jobs:
           static const char *astr(const jv *a, int i) { H *h = hget(a[i].l); return (h && h->kind == K_STR && h->s) ? h->s : "(null)"; }
           RH(noop) { (void)a; (void)r; }
           RH(emptystr) { (void)a; r->l = mk_str(""); }
-          RH(playSound) { static int n; r->j = ++g_snd_id; if (n++ < 12) L("[audio] playSound(\"%s\", f1=%.2f, f2=%.2f, i=%d) -> id %lld\n", astr(a, 0), (double)a[1].f, (double)a[2].f, a[3].i, (long long)r->j); }
-          RH(loadSound) { static int n; (void)r; if (n++ < 12) L("[audio] loadSound(\"%s\", \"%s\")\n", astr(a, 0), astr(a, 1)); }
-          RH(playMusic) { static int n; (void)r; if (n++ < 12) L("[audio] playMusic(\"%s\", %d, %d)\n", astr(a, 0), a[1].i, a[2].i); }
-          RH(playVoice) { static int n; (void)r; if (n++ < 12) L("[audio] playVoice(\"%s\")\n", astr(a, 0)); }
+          RH(playSound) { static int n; r->j = ++g_snd_id; au_play_sound(r->j, astr(a, 0), a[1].f, a[2].f, a[3].i); if (n++ < 30) L("[audio] playSound(\"%s\", vol=%.2f, pitch=%.2f, loop=%d) -> id %lld\n", astr(a, 0), (double)a[1].f, (double)a[2].f, a[3].i, (long long)r->j); }
+          RH(loadSound) { static int n; (void)r; au_load_sound(astr(a, 0), astr(a, 1)); if (n++ < 4) L("[audio] loadSound(\"%s\", \"%s\")\n", astr(a, 0), astr(a, 1)); }
+          RH(playMusic) { static int n; (void)r; if (n++ < 20) L("[audio] playMusic(\"%s\", enabled=%d, loop=%d)\n", astr(a, 0), a[1].i, a[2].i); au_play_music(astr(a, 0), a[1].i, a[2].i); }
+          RH(playVoice) { static int n; (void)r; if (n++ < 12) L("[audio] playVoice(\"%s\")\n", astr(a, 0)); au_play_voice(astr(a, 0)); }
+          RH(unloadSound) { (void)r; au_unload_sound(astr(a, 0)); }
+          RH(stopSound) { (void)r; au_stop_sound(a[0].j); }
+          RH(setSoundVolume) { (void)r; au_set_sound_vol(a[0].j, a[1].f); }
+          RH(setSoundPitch) { (void)r; au_set_sound_pitch(a[0].j, a[1].f); }
+          RH(stopMusic) { (void)a; (void)r; au_stop_music(); }
+          RH(setMusicVolume) { static int n; (void)r; if (n++ < 6) L("[audio] setMusicVolume(%.2f)\n", (double)a[0].f); au_set_music_vol(a[0].f); }
+          RH(setMusicEnabled) { static int n; (void)r; if (n++ < 6) L("[audio] setMusicEnabled(%d)\n", a[0].i); au_set_music_enabled(a[0].i); }
           RH(prompt) { r->j = ++g_prompt_id; L("[ui] prompt \"%s\" | \"%s\" | [%s] [%s] -> id %lld\n", astr(a, 0), astr(a, 1), astr(a, 2), astr(a, 3), (long long)r->j); }
           RH(checkPrompt) { static int n; r->i = 0; if (n++ < 3) L("[ui] checkPrompt(%lld) -> 0 (jawaban tombol pertama; Java asli: -2 = tak dikenal)\n", (long long)a[0].j); }
           RH(startDownload) { L("[net] startDownload(%lld, \"%s\") -> dilaporkan gagal (offline)\n", (long long)a[0].j, astr(a, 1)); (void)r; if (g_dl_n < 16) g_dl_q[g_dl_n++] = a[0].j; }
@@ -1078,7 +1098,9 @@ jobs:
 
           typedef struct { const char *name; void (*fn)(const jv *, jv *); } RHE;
           static const RHE rh_tab[] = {
-            {"playSound", rh_playSound}, {"loadSound", rh_loadSound}, {"playMusic", rh_playMusic}, {"playVoice", rh_playVoice},
+            {"playSound", rh_playSound}, {"loadSound", rh_loadSound}, {"playMusic", rh_playMusic}, {"playVoice", rh_playVoice}, {"unloadSound", rh_unloadSound},
+            {"stopSound", rh_stopSound}, {"setSoundVolume", rh_setSoundVolume}, {"setSoundPitch", rh_setSoundPitch}, {"stopMusic", rh_stopMusic},
+            {"setMusicVolume", rh_setMusicVolume}, {"setMusicEnabled", rh_setMusicEnabled},
             {"prompt", rh_prompt}, {"checkPrompt", rh_checkPrompt}, {"startDownload", rh_startDownload}, {"exitGame", rh_exitGame},
             {"playVideo", rh_playVideo}, {"openUrl", rh_openUrl}, {NULL, NULL}
           };
@@ -1103,6 +1125,7 @@ jobs:
             m->is_static = is_static; m->fn = rh_lookup(name); sig_parse(m);
             g_nmi++;
             pthread_mutex_unlock(&g_hmu);
+            if (g_nmi <= 120) L("[JNI] methodID baru: %s.%s %s%s\n", cls, name, sig, m->fn ? "" : "  (belum ada handler)");
             return m;
           }
           static void mi_dispatch(const void *mid, const jv *a, jv *r) {
@@ -1204,8 +1227,8 @@ jobs:
           static void *j_GetSuperclass(void *env, void *c) { (void)env; return c; }
           static int j_ret1(void *env) { (void)env; return 1; }
           static int j_IsInstanceOf(void *env, void *o, void *c) { (void)env; (void)o; (void)c; return 1; }
-          static void *j_GetMethodID(void *env, void *c, const char *n, const char *sig) { (void)env; if (g_jni_log++ < 200) L("[JNI] GetMethodID(%s.%s %s)\n", h2s(c), n, sig); return mk_method(h2s(c), n, sig, 0); }
-          static void *j_GetStaticMethodID(void *env, void *c, const char *n, const char *sig) { (void)env; if (g_jni_log++ < 200) L("[JNI] GetStaticMethodID(%s.%s %s)\n", h2s(c), n, sig); return mk_method(h2s(c), n, sig, 1); }
+          static void *j_GetMethodID(void *env, void *c, const char *n, const char *sig) { (void)env; return mk_method(h2s(c), n, sig, 0); }
+          static void *j_GetStaticMethodID(void *env, void *c, const char *n, const char *sig) { (void)env; return mk_method(h2s(c), n, sig, 1); }
           static char g_fid;
           static void *j_GetFieldID(void *env, void *c, const char *n, const char *sig) { (void)env; L("[JNI] GetFieldID/GetStaticFieldID(%s.%s %s) -> dummy\n", h2s(c), n, sig); return &g_fid; }
           static void *j_fieldNULL(void *env, void *o, void *f) { (void)env; (void)o; (void)f; return NULL; }
@@ -1378,6 +1401,233 @@ jobs:
             }
           }
 
+          /* ======================= audio: mixer SDL2 + WAV PCM16 =======================
+           * Game memanggil loadSound(nama, path-m4a-di-APK) / playSound / playMusic ... (semula ditangani SoundPool & MediaPlayer di Java).
+           * Decoder AAC tidak ada di device, jadi audio dikonversi SEKALI di PC oleh convert_audio.py ke audio/Samples/<id>.wav dan audio/Music/<id>.wav.
+           * Efek: dimuat penuh ke RAM, di-resample ke 44.1 kHz, dimix sampai 32 suara (volume, pitch, loop gaya SoundPool: 0=sekali, -1=terus, N=ulang N kali).
+           * Musik: satu track, dimuat penuh di thread terpisah (agar frame tidak tersendat), loop/jeda/volume. */
+          #define AU_RATE 44100
+          #define AU_MAXSND 160
+          #define AU_MAXVOX 32
+          static int g_audio = 1;                 /* --audio 0 = matikan semua suara */
+          static int au_ok, au_tried;
+          static uint32_t au_dev;
+          static int (*p_SDL_OpenAudioDevice)(const char *, int, const void *, void *, int);
+          static void (*p_SDL_PauseAudioDevice)(uint32_t, int);
+          static void (*p_SDL_LockAudioDevice)(uint32_t);
+          static void (*p_SDL_UnlockAudioDevice)(uint32_t);
+          typedef struct { char name[96]; int16_t *pcm; long n; } AuSnd;
+          typedef struct { int snd, active, loops; double pos, step; float vol; int64_t id; } AuVox;
+          typedef struct { int16_t *pcm; long n; double pos; int loop, playing; } AuMus;
+          static AuSnd au_snd[AU_MAXSND]; static int au_nsnd, au_nsnd_empty;
+          static AuVox au_vox[AU_MAXVOX];
+          static AuMus au_mus;
+          static float au_mvol = 1.f;
+          static int au_menabled = 1;
+          static volatile int au_mgen;
+          #define AU_LOCK() do { if (au_ok) p_SDL_LockAudioDevice(au_dev); } while (0)
+          #define AU_UNLOCK() do { if (au_ok) p_SDL_UnlockAudioDevice(au_dev); } while (0)
+
+          /* "…/Media/Music/123.m4a" -> "audio/Music/123.wav"; tanpa "/Media/" -> "audio/<nama-berkas>.wav" */
+          static void au_wav_path(const char *apkpath, char *out, size_t n) {
+            const char *rest = strstr(apkpath, "/Media/"), *dot;
+            size_t l;
+            if (rest) rest += 7; else { rest = strrchr(apkpath, '/'); rest = rest ? rest + 1 : apkpath; }
+            snprintf(out, n, "audio/%s", rest);
+            dot = strrchr(out, '.'); l = dot && strchr(dot, '/') == NULL ? (size_t)(dot - out) : strlen(out);
+            if (l + 5 < n) { memcpy(out + l, ".wav", 5); }
+          }
+          static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+          static uint32_t rd16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
+          /* hasil: stereo s16 pada AU_RATE (mono diduplikasi, rate lain di-resample linear); NULL bila berkas tak ada/format tidak didukung */
+          static int16_t *au_load_wav(const char *path, long *frames_out) {
+            FILE *f = fopen(path, "rb");
+            uint8_t *b; long len, off = 12, dlen = 0, frames, i; const uint8_t *dp = NULL;
+            uint32_t fmt = 0, ch = 0, rate = 0, bits = 0;
+            int16_t *out, *raw;
+            *frames_out = 0;
+            if (!f) return NULL;
+            fseek(f, 0, SEEK_END); len = ftell(f); fseek(f, 0, SEEK_SET);
+            if (len < 44) { fclose(f); return NULL; }
+            b = malloc((size_t)len);
+            if (!b || fread(b, 1, (size_t)len, f) != (size_t)len) { free(b); fclose(f); return NULL; }
+            fclose(f);
+            if (memcmp(b, "RIFF", 4) || memcmp(b + 8, "WAVE", 4)) { free(b); return NULL; }
+            while (off + 8 <= len) {
+              uint32_t sz = rd32(b + off + 4);
+              const uint8_t *body = b + off + 8;
+              if (!memcmp(b + off, "fmt ", 4) && off + 8 + 16 <= len) { fmt = rd16(body); ch = rd16(body + 2); rate = rd32(body + 4); bits = rd16(body + 14); }
+              else if (!memcmp(b + off, "data", 4)) { dp = body; dlen = (long)sz; if (off + 8 + dlen > len) dlen = len - off - 8; break; }
+              off += 8 + (long)sz + (long)(sz & 1);
+            }
+            if (!dp || (fmt != 1 && fmt != 0xFFFE) || bits != 16 || (ch != 1 && ch != 2) || rate == 0) { free(b); return NULL; }
+            frames = dlen / (long)(2 * ch);
+            raw = malloc((size_t)(frames > 0 ? frames : 1) * 4);
+            if (!raw) { free(b); return NULL; }
+            for (i = 0; i < frames; i++) {
+              int16_t l = (int16_t)rd16(dp + (size_t)i * 2 * ch), r = ch == 2 ? (int16_t)rd16(dp + (size_t)i * 4 + 2) : l;
+              raw[i * 2] = l; raw[i * 2 + 1] = r;
+            }
+            free(b);
+            if (rate == AU_RATE || frames == 0) { *frames_out = frames; return raw; }
+            { long outn = (long)((double)frames * AU_RATE / (double)rate), k;
+              out = malloc((size_t)(outn > 0 ? outn : 1) * 4);
+              if (!out) { free(raw); return NULL; }
+              for (k = 0; k < outn; k++) {
+                double sp = (double)k * (double)rate / AU_RATE, fr; long i0 = (long)sp, i1; int c;
+                if (i0 >= frames) i0 = frames - 1;
+                i1 = i0 + 1 < frames ? i0 + 1 : i0; fr = sp - (double)i0;
+                for (c = 0; c < 2; c++) out[k * 2 + c] = (int16_t)(raw[i0 * 2 + c] + (raw[i1 * 2 + c] - raw[i0 * 2 + c]) * fr);
+              }
+              free(raw); *frames_out = outn; return out; }
+          }
+
+          static void au_callback(void *ud, uint8_t *stream, int len) {
+            int16_t *o = (int16_t *)stream;
+            int frames = len / 4, i, v;
+            (void)ud;
+            for (i = 0; i < frames; i++) {
+              float l = 0.f, r = 0.f;
+              for (v = 0; v < AU_MAXVOX; v++) {
+                AuVox *x = &au_vox[v];
+                const AuSnd *s;
+                long i0, i1; float fr;
+                if (!x->active) continue;
+                s = &au_snd[x->snd];
+                if (!s->pcm || x->pos >= (double)s->n) {
+                  if (s->pcm && x->loops != 0 && s->n > 0) { if (x->loops > 0) x->loops--; x->pos -= (double)s->n; if (x->pos < 0) x->pos = 0; }
+                  else { x->active = 0; continue; }
+                }
+                i0 = (long)x->pos; fr = (float)(x->pos - (double)i0); i1 = i0 + 1 < s->n ? i0 + 1 : i0;
+                l += ((float)s->pcm[i0 * 2] + ((float)s->pcm[i1 * 2] - (float)s->pcm[i0 * 2]) * fr) * x->vol;
+                r += ((float)s->pcm[i0 * 2 + 1] + ((float)s->pcm[i1 * 2 + 1] - (float)s->pcm[i0 * 2 + 1]) * fr) * x->vol;
+                x->pos += x->step;
+              }
+              if (au_mus.pcm && au_mus.playing && au_menabled) {
+                long p = (long)au_mus.pos;
+                if (p >= au_mus.n) { if (au_mus.loop && au_mus.n > 0) { au_mus.pos = 0; p = 0; } else { au_mus.playing = 0; p = -1; } }
+                if (p >= 0) { l += (float)au_mus.pcm[p * 2] * au_mvol; r += (float)au_mus.pcm[p * 2 + 1] * au_mvol; au_mus.pos += 1.0; }
+              }
+              if (l > 32767.f) l = 32767.f;
+              if (l < -32768.f) l = -32768.f;
+              if (r > 32767.f) r = 32767.f;
+              if (r < -32768.f) r = -32768.f;
+              o[i * 2] = (int16_t)l; o[i * 2 + 1] = (int16_t)r;
+            }
+          }
+
+          static int au_init(void) {
+            struct { int freq; uint16_t format; uint8_t channels, silence; uint16_t samples, padding; uint32_t size; void (*callback)(void *, uint8_t *, int); void *userdata; } want, have;
+            int (*initsub)(uint32_t);
+            void *h;
+            if (au_tried) return au_ok;
+            au_tried = 1;
+            if (!g_audio) { L("[audio] dimatikan (--audio 0)\n"); return 0; }
+            h = sdl_h ? sdl_h : dlopen("libSDL2-2.0.so.0", RTLD_NOW | RTLD_GLOBAL);
+            if (!h) { L("[audio] SDL2 tidak bisa dibuka -> tanpa suara\n"); return 0; }
+            *(void **)&initsub = dlsym(h, "SDL_InitSubSystem");
+            *(void **)&p_SDL_OpenAudioDevice = dlsym(h, "SDL_OpenAudioDevice");
+            *(void **)&p_SDL_PauseAudioDevice = dlsym(h, "SDL_PauseAudioDevice");
+            *(void **)&p_SDL_LockAudioDevice = dlsym(h, "SDL_LockAudioDevice");
+            *(void **)&p_SDL_UnlockAudioDevice = dlsym(h, "SDL_UnlockAudioDevice");
+            if (!initsub || !p_SDL_OpenAudioDevice || !p_SDL_PauseAudioDevice || !p_SDL_LockAudioDevice || !p_SDL_UnlockAudioDevice) { L("[audio] simbol SDL audio kurang -> tanpa suara\n"); return 0; }
+            if (initsub(0x10u) != 0) { L("[audio] SDL_InitSubSystem(AUDIO) gagal -> tanpa suara\n"); return 0; }
+            memset(&want, 0, sizeof want); memset(&have, 0, sizeof have);
+            want.freq = AU_RATE; want.format = 0x8010; want.channels = 2; want.samples = 1024; want.callback = au_callback;
+            au_dev = (uint32_t)p_SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+            if (au_dev == 0) { L("[audio] SDL_OpenAudioDevice gagal -> tanpa suara\n"); return 0; }
+            L("[audio] perangkat audio OK: minta %d Hz s16 stereo, dapat %d Hz fmt=0x%x ch=%d samples=%d\n", want.freq, have.freq, have.format, have.channels, have.samples);
+            p_SDL_PauseAudioDevice(au_dev, 0);
+            au_ok = 1;
+            return 1;
+          }
+
+          static AuSnd *au_find(const char *name) { int i; for (i = 0; i < au_nsnd; i++) if (!strcmp(au_snd[i].name, name)) return &au_snd[i]; return NULL; }
+          static void au_load_sound(const char *name, const char *apkpath) {
+            char wav[760];
+            AuSnd *s;
+            int16_t *pcm; long n = 0;
+            if (!g_audio) return;
+            if (!au_init()) return;
+            if (au_find(name) || au_nsnd >= AU_MAXSND) return;
+            au_wav_path(apkpath, wav, sizeof wav);
+            pcm = au_load_wav(wav, &n);
+            s = &au_snd[au_nsnd];
+            snprintf(s->name, sizeof s->name, "%s", name);
+            AU_LOCK(); s->pcm = pcm; s->n = n; au_nsnd++; AU_UNLOCK();
+            if (!pcm) { if (au_nsnd_empty++ < 5) L("[audio] WAV tidak ada/tidak valid: %s (jalankan convert_audio.py)\n", wav); }
+          }
+          static void au_unload_sound(const char *name) {
+            AuSnd *s = au_find(name);
+            int v;
+            int16_t *old;
+            if (!s || !au_ok) return;
+            AU_LOCK();
+            for (v = 0; v < AU_MAXVOX; v++) if (au_vox[v].active && &au_snd[au_vox[v].snd] == s) au_vox[v].active = 0;
+            old = s->pcm; s->pcm = NULL; s->n = 0;
+            AU_UNLOCK();
+            free(old);
+          }
+          static void au_play_sound(int64_t id, const char *name, float vol, float pitch, int loop) {
+            AuSnd *s = au_find(name);
+            int v, pick = 0;
+            if (!au_ok || !s || !s->pcm) return;
+            AU_LOCK();
+            for (v = 0; v < AU_MAXVOX; v++) { if (!au_vox[v].active) { pick = v; break; } if (au_vox[v].id < au_vox[pick].id) pick = v; }
+            au_vox[pick].snd = (int)(s - au_snd); au_vox[pick].pos = 0; au_vox[pick].loops = loop; au_vox[pick].vol = vol; au_vox[pick].step = pitch > 0.f ? (double)pitch : 1.0;
+            au_vox[pick].id = id; au_vox[pick].active = 1;
+            AU_UNLOCK();
+          }
+          static AuVox *au_vox_by_id(int64_t id) { int v; for (v = 0; v < AU_MAXVOX; v++) if (au_vox[v].active && au_vox[v].id == id) return &au_vox[v]; return NULL; }
+          static void au_stop_sound(int64_t id) { AuVox *x; if (!au_ok) return; AU_LOCK(); x = au_vox_by_id(id); if (x) x->active = 0; AU_UNLOCK(); }
+          static void au_set_sound_vol(int64_t id, float v) { AuVox *x; if (!au_ok) return; AU_LOCK(); x = au_vox_by_id(id); if (x) x->vol = v; AU_UNLOCK(); }
+          static void au_set_sound_pitch(int64_t id, float p) { AuVox *x; if (!au_ok) return; AU_LOCK(); x = au_vox_by_id(id); if (x && p > 0.f) x->step = (double)p; AU_UNLOCK(); }
+
+          typedef struct { char path[760]; int loop, gen; } MusReq;
+          static void *mus_thread(void *p) {
+            MusReq *rq = p;
+            char wav[760];
+            long n = 0;
+            int16_t *pcm, *old;
+            au_wav_path(rq->path, wav, sizeof wav);
+            pcm = au_load_wav(wav, &n);
+            if (!pcm) { L("[audio] musik: WAV tidak ada/tidak valid: %s (jalankan convert_audio.py)\n", wav); free(rq); return NULL; }
+            AU_LOCK();
+            if (rq->gen != au_mgen) { AU_UNLOCK(); free(pcm); free(rq); return NULL; }   /* dibatalkan (stopMusic/playMusic baru) selama memuat */
+            old = au_mus.pcm; au_mus.pcm = pcm; au_mus.n = n; au_mus.pos = 0; au_mus.loop = rq->loop; au_mus.playing = 1;
+            AU_UNLOCK();
+            free(old);
+            L("[audio] musik dimuat: %s (%ld frame, %.1f dtk, loop=%d)\n", wav, n, (double)n / AU_RATE, rq->loop);
+            free(rq);
+            return NULL;
+          }
+          static void au_play_music(const char *path, int enabled, int loopcount) {
+            MusReq *rq;
+            pthread_t th;
+            if (!g_audio || !au_init()) return;
+            AU_LOCK(); au_menabled = enabled != 0; au_mus.playing = 0; au_mgen++; AU_UNLOCK();
+            rq = calloc(1, sizeof *rq);
+            if (!rq) return;
+            snprintf(rq->path, sizeof rq->path, "%s", path); rq->loop = loopcount != 0; rq->gen = au_mgen;
+            if (pthread_create(&th, NULL, mus_thread, rq) == 0) pthread_detach(th); else free(rq);
+          }
+          static void au_stop_music(void) { int16_t *old; if (!au_ok) return; AU_LOCK(); au_mgen++; au_mus.playing = 0; old = au_mus.pcm; au_mus.pcm = NULL; au_mus.n = 0; AU_UNLOCK(); free(old); }
+          static void au_set_music_vol(float v) { au_mvol = v < 0 ? -v : v; }
+          static void au_set_music_enabled(int e) { au_menabled = e != 0; }
+          static void au_play_voice(const char *path) {
+            static int64_t vid = 1000000;
+            char nm[100];
+            if (!g_audio || !au_init()) return;
+            snprintf(nm, sizeof nm, "voice:%.80s", path);
+            au_load_sound(nm, path);
+            au_play_sound(++vid, nm, 1.f, 1.f, 0);
+          }
+          static void au_report(void) {
+            int i, ok = 0;
+            for (i = 0; i < au_nsnd; i++) if (au_snd[i].pcm) ok++;
+            L("[audio] ringkasan: %d efek terdaftar, %d berhasil dimuat, %d tanpa WAV | perangkat %s\n", au_nsnd, ok, au_nsnd - ok, au_ok ? "aktif" : "TIDAK aktif");
+          }
+
           /* ======================= titik masuk native (static JNI: env, kelas, responder, ...) ======================= */
           typedef void (*nf_init_t)(void *, void *, void *, void *, void *, int, int, void *, void *, int);
           typedef void (*nf_r_t)(void *, void *, void *);
@@ -1420,6 +1670,7 @@ jobs:
           static float to_px(float x) { return g_ww > 0 ? x * (float)g_dw / (float)g_ww : x; }
           static float to_py(float y) { return g_wh > 0 ? y * (float)g_dh / (float)g_wh : y; }
           static int g_ptr_down;
+          static int g_shot_req;   /* START+L1 = minta tangkapan layar pada frame berikutnya */
           static float now_s(void) { return (float)p_SDL_GetTicks() * 0.001f; }
           static void pump_events(void) {
             unsigned char ev[64] __attribute__((aligned(8)));
@@ -1432,6 +1683,7 @@ jobs:
                 if (b == 4) g_sel = down;
                 if (b == 6) g_start = down;
                 if (g_sel && g_start) { L("[input] SELECT+START -> keluar\n"); g_quit = 1; }
+                if (b == 9 && down && g_start) { g_shot_req = 1; L("[input] START+L1 -> tangkapan layar\n"); continue; }
                 if (b >= 0 && b < 15 && pad_map[b]) send_key(pad_map[b], down); else L("[input] tombol %d tidak dipetakan\n", b);
               } else if (t == 0x650) {                                                          /* CONTROLLERAXISMOTION */
                 float v = (float)(*(int16_t *)(ev + 16)) / 32768.f;
@@ -1504,7 +1756,7 @@ jobs:
             return -1;
           }
 
-          typedef struct { int frames, w, h, lofi; const char *locale, *overrides, *apk, *shots; } RunCfg;
+          typedef struct { int frames, w, h, lofi; const char *locale, *overrides, *apk, *shots; int maxtime; } RunCfg;
           static int shot_wanted(const char *list, int frame) {
             const char *p = list;
             while (p && *p) {
@@ -1540,14 +1792,17 @@ jobs:
             nf_Init(ENV, g_ni_cls, g_resp, mk_str(bundle), mk_str(userdir), g_dw, g_dh, mk_str(c->locale), mk_str(c->overrides), c->lofi);
             local_reset();
             L("== NativeInit selesai (%.0f ms) ==\n", (double)(now_ns() - t0) / 1e6);
+            au_report();
             g_phase = "NativeResized"; nf_Resized(ENV, g_ni_cls, g_resp, g_dw, g_dh); local_reset();
             g_phase = "NativeActivate"; nf_Activate(ENV, g_ni_cls, g_resp); local_reset();
             if (p_glGetError) L("[gl] glGetError setelah init: 0x%x\n", p_glGetError());
 
             L("\n== loop render (%s) ==\n", c->frames < 0 ? "tanpa batas; SELECT+START untuk keluar" : "terbatas");
             tl = now_ns();
+            { long long tstart = tl;
             while (!g_quit && (c->frames < 0 || frame < c->frames)) {
               g_frame = frame;
+              if (c->maxtime > 0 && now_ns() - tstart > (long long)c->maxtime * 1000000000LL) { L("[game] --maxtime %d dtk tercapai -> keluar\n", c->maxtime); break; }
               pump_events();
               g_phase = "NativeRender"; alarm((unsigned)(timeout > 0 ? timeout : 60));
               nf_Render(ENV, g_ni_cls, g_resp, 60.0f, 1);
@@ -1555,10 +1810,11 @@ jobs:
               for (i = 0; i < g_dl_n; i++) { g_phase = "NativeDownloadFailure"; nf_DlFail(ENV, g_ni_cls, g_resp, g_dl_q[i]); local_reset(); }
               g_dl_n = 0;
               if (frame < 5 && p_glGetError) { unsigned e = p_glGetError(); if (e) L("[gl] frame %d: glGetError = 0x%x\n", frame, e); }
-              if (shot_wanted(c->shots, frame)) take_shot(frame);
+              if (shot_wanted(c->shots, frame) || g_shot_req) { take_shot(frame); g_shot_req = 0; }
               p_SDL_GL_SwapWindow(g_win);
               frame++;
               if (frame % 120 == 0) { long long t = now_ns(); L("[fps] frame %d: %.1f fps\n", frame, 120.0 * 1e9 / (double)(t - tl)); tl = t; }
+            }
             }
             alarm(0);
             L("\n== loop selesai di frame %d (%s) ==\n", frame, g_quit ? "keluar diminta" : "batas frame tercapai");
@@ -1573,6 +1829,17 @@ jobs:
           typedef uint8_t (*t_boolm)(void *, void *, void *, ...);
           typedef void (*t_voidm)(void *, void *, void *, ...);
           static int T_(int ok, const char *what) { L("  %-58s %s\n", what, ok ? "LULUS" : "GAGAL"); return ok ? 0 : 1; }
+          static void write_test_wav(const char *path) {
+            uint8_t w[44 + 200];
+            int i;
+            FILE *f;
+            memset(w, 0, sizeof w);
+            memcpy(w, "RIFF", 4); w[4] = (uint8_t)(sizeof w - 8); memcpy(w + 8, "WAVEfmt ", 8); w[16] = 16; w[20] = 1; w[22] = 1;
+            w[24] = 0x22; w[25] = 0x56; w[28] = 0x44; w[29] = 0xAC; w[32] = 2; w[34] = 16; memcpy(w + 36, "data", 4); w[40] = 200;   /* mono 22050 Hz, 100 sampel */
+            for (i = 0; i < 100; i++) { int16_t s = (int16_t)(i * 100); w[44 + i * 2] = (uint8_t)(s & 255); w[45 + i * 2] = (uint8_t)((s >> 8) & 255); }
+            f = fopen(path, "wb");
+            if (f) { fwrite(w, 1, sizeof w, f); fclose(f); }
+          }
           static int selftest(void) {
             int bad = 0;
             char buf[32];
@@ -1628,6 +1895,87 @@ jobs:
             { uint8_t px[4 * 4 * 4]; int nb, r, g, b; memset(px, 0, sizeof px); px[0] = 200; px[1] = 100; px[2] = 50; pixel_stats(px, 4, 4, &nb, &r, &g, &b);
               bad += T_(nb == 6 && write_bmp("selftest.bmp", px, 4, 4) == 0, "pixel_stats + penulis BMP"); remove("selftest.bmp"); }
             bad += T_(shot_wanted("120,300", 300) && !shot_wanted("120,300", 299), "daftar frame tangkapan layar");
+
+            /* ---- audio: path, WAV, mixer, musik, perangkat SDL (driver dummy) ---- */
+            { char wp[128];
+              au_wav_path("/mnt/x/bean.apk/assets/Media/Music/123.m4a", wp, sizeof wp);
+              bad += T_(!strcmp(wp, "audio/Music/123.wav"), "au_wav_path: Media/Music/123.m4a -> audio/Music/123.wav");
+              au_wav_path("/foo/bar.m4a", wp, sizeof wp);
+              bad += T_(!strcmp(wp, "audio/bar.wav"), "au_wav_path tanpa /Media/ -> audio/bar.wav"); }
+            { long fr = 0; int16_t *p;
+              write_test_wav("selftest.wav");
+              p = au_load_wav("selftest.wav", &fr);
+              bad += T_(p && fr >= 198 && fr <= 200 && p[0] == 0 && p[200] == p[201] && p[200] > 4000 && p[200] < 6000, "au_load_wav: mono 22.05k -> stereo 44.1k (resample linear)");
+              free(p); remove("selftest.wav");
+              bad += T_(au_load_wav("tidak_ada.wav", &fr) == NULL, "au_load_wav: berkas tak ada -> NULL"); }
+            { static int16_t cst[2000], ramp[4000];
+              int16_t out[256];
+              int k, ok;
+              for (k = 0; k < 1000; k++) { cst[k * 2] = 10000; cst[k * 2 + 1] = -10000; }
+              for (k = 0; k < 2000; k++) { ramp[k * 2] = (int16_t)(k * 10); ramp[k * 2 + 1] = (int16_t)(k * 10); }
+              snprintf(au_snd[0].name, sizeof au_snd[0].name, "cst"); au_snd[0].pcm = cst; au_snd[0].n = 1000;
+              snprintf(au_snd[1].name, sizeof au_snd[1].name, "ramp"); au_snd[1].pcm = ramp; au_snd[1].n = 2000; au_nsnd = 2;
+              memset(au_vox, 0, sizeof au_vox);
+              au_vox[0].snd = 0; au_vox[0].active = 1; au_vox[0].step = 1.0; au_vox[0].vol = 0.5f; au_vox[0].id = 7;
+              au_callback(NULL, (uint8_t *)out, 512);
+              bad += T_(out[0] == 5000 && out[1] == -5000 && out[254] == 5000, "mixer: efek volume 0.5 -> 5000 / -5000");
+              bad += T_(au_vox_by_id(7) == &au_vox[0] && au_vox_by_id(8) == NULL, "mixer: cari suara berdasarkan id");
+              for (k = 0; k < 8; k++) au_callback(NULL, (uint8_t *)out, 512);
+              bad += T_(!au_vox[0].active && out[0] == 0, "mixer: suara berhenti di akhir sampel (1000 frame)");
+              memset(au_vox, 0, sizeof au_vox); au_vox[0].active = 1; au_vox[0].loops = -1; au_vox[0].step = 1.0; au_vox[0].vol = 1.f;
+              for (k = 0; k < 20; k++) au_callback(NULL, (uint8_t *)out, 512);
+              bad += T_(au_vox[0].active && out[0] == 10000, "mixer: loop -1 berputar terus (2560 frame)");
+              memset(au_vox, 0, sizeof au_vox); au_vox[0].active = 1; au_vox[0].loops = 1; au_vox[0].step = 1.0; au_vox[0].vol = 1.f;
+              ok = 1;
+              for (k = 0; k < 8; k++) au_callback(NULL, (uint8_t *)out, 512);   /* 1024 frame: putaran pertama selesai, ulang ke-1 jalan */
+              ok = au_vox[0].active;
+              for (k = 0; k < 10; k++) au_callback(NULL, (uint8_t *)out, 512);   /* total 2304 frame > 2000 */
+              bad += T_(ok && !au_vox[0].active, "mixer: loop 1 = diulang 1 kali lalu berhenti");
+              memset(au_vox, 0, sizeof au_vox); au_vox[0].snd = 1; au_vox[0].active = 1; au_vox[0].step = 2.0; au_vox[0].vol = 1.f;
+              au_callback(NULL, (uint8_t *)out, 512);
+              bad += T_(out[10] == 100 && out[12] == 120, "mixer: pitch 2.0 membaca sampel dua kali lebih cepat");
+              memset(au_vox, 0, sizeof au_vox);
+              au_vox[0].active = 1; au_vox[0].step = 1.0; au_vox[0].vol = 4.f; au_vox[1].active = 1; au_vox[1].step = 1.0; au_vox[1].vol = 4.f;
+              au_callback(NULL, (uint8_t *)out, 512);
+              bad += T_(out[0] == 32767 && out[1] == -32768, "mixer: clipping dua suara keras");
+              memset(au_vox, 0, sizeof au_vox);
+              au_mus.pcm = cst; au_mus.n = 1000; au_mus.pos = 0; au_mus.loop = 1; au_mus.playing = 1; au_mvol = 1.f; au_menabled = 1;
+              au_callback(NULL, (uint8_t *)out, 512);
+              bad += T_(out[0] == 10000 && out[1] == -10000, "musik: diputar penuh volume");
+              au_set_music_enabled(0); au_callback(NULL, (uint8_t *)out, 512);
+              bad += T_(out[0] == 0, "musik: setMusicEnabled(0) membisukan");
+              au_set_music_enabled(1); au_set_music_vol(-0.5f); au_callback(NULL, (uint8_t *)out, 512);
+              bad += T_(out[0] == 5000, "musik: setMusicVolume memakai nilai absolut (0.5)");
+              for (k = 0; k < 20; k++) au_callback(NULL, (uint8_t *)out, 512);
+              bad += T_(au_mus.playing, "musik: loop berputar melewati akhir track");
+              au_mus.loop = 0; au_mus.pos = 0; for (k = 0; k < 9; k++) au_callback(NULL, (uint8_t *)out, 512);
+              bad += T_(!au_mus.playing, "musik: tanpa loop berhenti di akhir track");
+              memset(&au_mus, 0, sizeof au_mus); memset(au_snd, 0, sizeof au_snd); au_nsnd = 0; au_mvol = 1.f; }
+            { int ok;
+              setenv("SDL_AUDIODRIVER", "dummy", 1);
+              g_audio = 1;
+              ok = au_init();
+              if (!ok) T_(1, "perangkat SDL audio: tidak tersedia di host (dilewati)");
+              else {
+                int pass = 1, w;
+                mkdir("audio", 0755); mkdir("audio/Samples", 0755); mkdir("audio/Music", 0755);
+                write_test_wav("audio/Samples/selftest.wav"); write_test_wav("audio/Music/selftest.wav");
+                au_load_sound("kosong", "/a/Media/Samples/tidak_ada.m4a");
+                au_load_sound("tes", "/a/Media/Samples/selftest.m4a");
+                pass = pass && au_nsnd == 2 && au_snd[0].pcm == NULL && au_snd[1].pcm != NULL;
+                au_play_sound(42, "tes", 1.f, 1.f, -1);
+                au_play_music("/a/Media/Music/selftest.m4a", 1, 1);
+                usleep(250000);
+                pass = pass && au_vox_by_id(42) != NULL && au_mus.pcm != NULL && au_mus.playing;
+                for (w = 0; w < 5 && !(au_mus.pos > 0); w++) usleep(100000);
+                pass = pass && au_mus.pos > 0;
+                au_stop_sound(42); au_stop_music();
+                pass = pass && au_vox_by_id(42) == NULL && au_mus.pcm == NULL;
+                au_unload_sound("tes");
+                pass = pass && au_snd[1].pcm == NULL;
+                bad += T_(pass, "perangkat SDL audio (dummy): muat, mixing real-time, loop, stop, unload");
+                remove("audio/Samples/selftest.wav"); remove("audio/Music/selftest.wav"); rmdir("audio/Samples"); rmdir("audio/Music"); rmdir("audio");
+              } }
             (void)a2;
             L("== selftest %s ==\n", bad ? "ADA YANG GAGAL" : "SEMUA LULUS");
             return bad ? 1 : 0;
@@ -1637,7 +1985,7 @@ jobs:
           int main(int argc, char **argv) {
             const char *dir = "libs", *libname = "libKumoGame.so";
             int stage = 0, timeout = 60, i, do_selftest = 0;
-            RunCfg cfg = { -1, 640, 480, 1, "en_US", ",console,controller", NULL, "120" };
+            RunCfg cfg = { -1, 640, 480, 1, "en_US", ",console,controller", NULL, "120", 0 };
             int frames_set = 0;
             Mod *kg = NULL;
             struct sigaction sa;
@@ -1650,6 +1998,8 @@ jobs:
               else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) timeout = pint(argv[++i]);
               else if (!strcmp(argv[i], "--frames") && i + 1 < argc) { cfg.frames = pint(argv[++i]); frames_set = 1; }
               else if (!strcmp(argv[i], "--lofi") && i + 1 < argc) cfg.lofi = pint(argv[++i]);
+              else if (!strcmp(argv[i], "--audio") && i + 1 < argc) g_audio = pint(argv[++i]);
+              else if (!strcmp(argv[i], "--maxtime") && i + 1 < argc) cfg.maxtime = pint(argv[++i]);
               else if (!strcmp(argv[i], "--w") && i + 1 < argc) cfg.w = pint(argv[++i]);
               else if (!strcmp(argv[i], "--h") && i + 1 < argc) cfg.h = pint(argv[++i]);
               else if (!strcmp(argv[i], "--locale") && i + 1 < argc) cfg.locale = argv[++i];
@@ -1661,7 +2011,7 @@ jobs:
             }
             if (stage == 2 && !frames_set) cfg.frames = 300;   /* stage 2 = uji singkat; stage 3 = tanpa batas */
             g_log = fopen("loader_log.txt", "w");
-            L("== beanloader (Milestone 3: stage 0-3) ==\n");
+            L("== beanloader (Milestone 4: stage 0-3 + audio) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s/%s | stage=%d timeout=%ds\n", dir, libname, stage, timeout);
           #if !defined(__aarch64__)
@@ -1764,7 +2114,7 @@ jobs:
           EOF_SH1
           cat > out/BeanLoader.sh <<'EOF_SH2'
           #!/bin/bash
-          # Loader Bean Dreams (Milestone 3, arm64). Argumen dibaca dari loader.args, mis: --stage 2 --frames 300 --timeout 90 --shots 60,300
+          # Loader Bean Dreams (Milestone 4, arm64). Argumen dibaca dari loader.args, mis: --stage 3 --timeout 90 --maxtime 300
           # stage 0 = muat+relokasi | 1 = +konstruktor | 2 = +jendela/GLES2/NativeInit/N frame render | 3 = main tanpa batas (SELECT+START keluar)
           # Folder data dicari seperti launcher PortMaster lain: /$directory/ports/<nama>
 
@@ -1809,8 +2159,86 @@ jobs:
           sleep 2
           type pm_finish >/dev/null 2>&1 && pm_finish
           EOF_SH2
-          echo "--stage 2 --frames 300 --timeout 90 --shots 60,300" > out/bean_dreams/loader.args
-          echo "Taruh libKumoGame.so (dari lib/arm64-v8a di APK Bean Dreams) ke folder ini. Taruh juga APK-nya di folder game (satu level di atas folder ini), namanya bebas asal berakhiran .apk. Jangan di-upload ke GitHub." > out/bean_dreams/libs/TARUH-LIB-DI-SINI.txt
+          cat > out/bean_dreams/convert_audio.py <<'EOF_PY1'
+          #!/usr/bin/env python3
+          """Konversi audio Bean Dreams (m4a/AAC di dalam APK) -> WAV PCM16 stereo 44.1 kHz untuk beanloader.
+
+          Pakai:
+              python3 convert_audio.py bean-dreams-4-8.apk [folder_keluaran] [--rate 44100] [--ffmpeg ffmpeg]
+
+          Butuh ffmpeg di PATH (https://ffmpeg.org). Jalankan di PC (bukan di handheld), lalu salin folder hasilnya
+          ('audio') ke folder game di handheld, di samping beanloader:
+              bean_dreams/audio/Samples/*.wav
+              bean_dreams/audio/Music/*.wav
+          Hanya untuk pemakaian pribadi dari APK milik sendiri; jangan didistribusikan ulang."""
+          import os
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import zipfile
+
+          EXTS = (".m4a", ".mp3", ".ogg", ".aac", ".wav", ".mp4")
+          PREFIX = "assets/Media/"
+
+
+          def main(argv):
+              args = [a for a in argv[1:] if not a.startswith("--")]
+              opts = {}
+              it = iter(argv[1:])
+              for a in it:
+                  if a in ("--rate", "--ffmpeg"):
+                      opts[a] = next(it, "")
+              if not args:
+                  print(__doc__)
+                  return 2
+              apk = args[0]
+              out_root = args[1] if len(args) > 1 else "audio"
+              rate = opts.get("--rate", "44100")
+              ffmpeg = opts.get("--ffmpeg", "ffmpeg")
+              if shutil.which(ffmpeg) is None:
+                  print("ffmpeg tidak ditemukan. Pasang ffmpeg dan pastikan ada di PATH (atau pakai --ffmpeg /path/ke/ffmpeg).")
+                  return 1
+              zf = zipfile.ZipFile(apk)
+              items = [n for n in zf.namelist() if n.startswith(PREFIX) and n.lower().endswith(EXTS) and not n.endswith("/")]
+              # video (Intro.mp4 dsb.) tidak diperlukan: loader melewati video
+              items = [n for n in items if not n.lower().endswith(".mp4") and "/Video/" not in n]
+              if not items:
+                  print("Tidak ada berkas audio di", PREFIX, "dalam", apk)
+                  return 1
+              ok = fail = 0
+              total = 0
+              tmp = tempfile.mkdtemp(prefix="beanaudio_")
+              try:
+                  for i, name in enumerate(sorted(items), 1):
+                      rest = name[len(PREFIX):]
+                      dst = os.path.join(out_root, os.path.splitext(rest)[0] + ".wav")
+                      os.makedirs(os.path.dirname(dst), exist_ok=True)
+                      src = os.path.join(tmp, os.path.basename(name))
+                      with open(src, "wb") as f:
+                          f.write(zf.read(name))
+                      cmd = [ffmpeg, "-y", "-loglevel", "error", "-i", src, "-vn", "-ac", "2", "-ar", rate, "-c:a", "pcm_s16le", dst]
+                      r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                      os.remove(src)
+                      if r.returncode == 0 and os.path.exists(dst):
+                          ok += 1
+                          total += os.path.getsize(dst)
+                          print("[%d/%d] %s -> %s" % (i, len(items), rest, dst))
+                      else:
+                          fail += 1
+                          print("[%d/%d] GAGAL %s: %s" % (i, len(items), rest, r.stderr.decode("utf8", "replace").strip()[:200]))
+              finally:
+                  shutil.rmtree(tmp, ignore_errors=True)
+              print("\nSelesai: %d berhasil, %d gagal, total %.1f MB di '%s'" % (ok, fail, total / 1e6, out_root))
+              print("Salin folder '%s' ke folder game di handheld (di samping beanloader)." % out_root)
+              return 0 if fail == 0 else 1
+
+
+          if __name__ == "__main__":
+              sys.exit(main(sys.argv))
+          EOF_PY1
+          echo "--stage 3 --timeout 90 --maxtime 300 --shots 300" > out/bean_dreams/loader.args
+          echo "Taruh libKumoGame.so (dari lib/arm64-v8a di APK Bean Dreams) ke folder ini. Taruh juga APK-nya di folder game (satu level di atas folder ini), namanya bebas asal berakhiran .apk. Untuk suara: jalankan convert_audio.py di PC lalu salin folder audio/ ke folder game. Jangan di-upload ke GitHub." > out/bean_dreams/libs/TARUH-LIB-DI-SINI.txt
 
       - name: Kompilasi (aarch64)
         run: |
